@@ -1,115 +1,149 @@
 #!/usr/bin/env python3
 """
-RoundTable — FastAPI rewrite.
+ContactSwap — Redis-backed rewrite.
 
-Performance improvements over the original http.server version:
-  1. Async long-poll: threads are no longer pinned during the 20-second wait.
-     asyncio.sleep() yields the event loop so other requests run freely.
-  2. asyncio.Event per room: polls wake up *instantly* when state changes
-     instead of sleeping up to 1 second between checks.
-  3. Per-room locks: requests for different rooms never block each other.
-  4. Pydantic models: request bodies are validated and typed automatically.
-  5. FastAPI's StaticFiles: index.html is served efficiently without custom code.
+Replaces the in-memory `rooms` dict with Leapcell Redis so that room state
+survives restarts and is visible to every instance regardless of how the
+platform routes requests.
 
-Dev server:       uvicorn server:app --reload --port 8080
-Production:       see wsgi.py / README
+Storage layout (Redis keys)
+---------------------------
+  room:{code}              — Hash  {code, created_at, last_activity, connected,
+                                     member_ids (JSON list)}
+  room:{code}:member:{id}  — Hash  {id, name, url}
+
+Pub/Sub
+-------
+  channel: room:{code}     — Published to whenever a member joins, leaves, or
+                             the room is connected. Wakes up waiting polls
+                             immediately instead of sleeping in a loop.
+
+Environment variables
+---------------------
+  REDIS_URL   — Redis connection string, e.g.
+                redis://default:password@host:6379
+                Set this in Leapcell → Service → Environment.
+
+Dev server:   uvicorn server:app --reload --port 8080
+Production:   see wsgi.py / README
 """
 
 import asyncio
+import json
+import os
 import random
 import string
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+import redis.asyncio as aioredis
 from fastapi import FastAPI, HTTPException, status
 from fastapi.responses import FileResponse
-from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, HttpUrl, field_validator
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-ROOM_TTL = 3600        # seconds before an idle room is evicted
-POLL_TIMEOUT = 20      # seconds a long-poll request waits for a change
+ROOM_TTL = 3600       # seconds; applied as Redis key TTL
+POLL_TIMEOUT = 20     # seconds a long-poll waits for a pub/sub message
 BASE_DIR = Path(__file__).parent
 
-
-# ── Data models ───────────────────────────────────────────────────────────────
-class Member(BaseModel):
-    id: str
-    name: str
-    url: str
+# ── Redis client (initialised in lifespan) ────────────────────────────────────
+_redis: aioredis.Redis | None = None
 
 
-class Room(BaseModel):
-    code: str
-    created_at: float
-    last_activity: float
-    connected: bool = False
-    members: dict[str, Member] = {}
+def get_redis() -> aioredis.Redis:
+    if _redis is None:
+        raise RuntimeError("Redis not initialised")
+    return _redis
 
 
-# ── In-memory store ───────────────────────────────────────────────────────────
-# Each room gets its own asyncio.Event so polls wake up the instant
-# someone joins or the room is connected, with zero polling delay.
-rooms: dict[str, Room] = {}
-room_locks: dict[str, asyncio.Lock] = {}      # per-room lock — rooms don't block each other
-room_events: dict[str, asyncio.Event] = {}    # per-room wake-up signal
-
-
+# ── Key helpers ───────────────────────────────────────────────────────────────
 def _new_id(k: int = 12) -> str:
     return "".join(random.choices(string.ascii_lowercase + string.digits, k=k))
 
 
-def _new_room_code() -> str:
-    for _ in range(200):
-        code = "".join(random.choices(string.digits, k=4))
-        if code not in rooms:
-            return code
-    raise RuntimeError("Could not generate a unique room code")
+def _room_key(code: str) -> str:
+    return f"room:{code}"
 
 
-def _room_state(room: Room, member_id: str) -> dict:
-    """Return the payload sent to polling clients."""
+def _member_key(code: str, member_id: str) -> str:
+    return f"room:{code}:member:{member_id}"
+
+
+def _channel(code: str) -> str:
+    return f"room:{code}"
+
+
+# ── Redis helpers ─────────────────────────────────────────────────────────────
+async def _get_room_meta(r: aioredis.Redis, code: str) -> dict | None:
+    data = await r.hgetall(_room_key(code))
+    if not data:
+        return None
+    return {k.decode(): v.decode() for k, v in data.items()}
+
+
+async def _get_members(r: aioredis.Redis, code: str, meta: dict) -> list[dict]:
+    member_ids = json.loads(meta.get("member_ids", "[]"))
+    members = []
+    for mid in member_ids:
+        raw = await r.hgetall(_member_key(code, mid))
+        if raw:
+            members.append({k.decode(): v.decode() for k, v in raw.items()})
+    return members
+
+
+async def _room_state(r: aioredis.Redis, code: str) -> dict:
+    meta = await _get_room_meta(r, code)
+    if not meta:
+        return {}
+    connected = meta.get("connected") == "1"
+    members = await _get_members(r, code, meta)
     members_out = (
-        [m.model_dump() for m in room.members.values()]
-        if room.connected
-        else [{"id": m.id, "name": m.name} for m in room.members.values()]
+        members
+        if connected
+        else [{"id": m["id"], "name": m["name"]} for m in members]
     )
     return {
-        "connected": room.connected,
-        "member_count": len(room.members),
+        "connected": connected,
+        "member_count": len(members),
         "members": members_out,
     }
 
 
-# ── Background cleanup task ───────────────────────────────────────────────────
-async def _cleanup_loop():
-    """Evict rooms that have been idle for more than ROOM_TTL seconds."""
-    while True:
-        await asyncio.sleep(60)
-        now = time.time()
-        expired = [
-            code for code, room in list(rooms.items())
-            if now - room.last_activity > ROOM_TTL
-        ]
-        for code in expired:
-            rooms.pop(code, None)
-            room_locks.pop(code, None)
-            room_events.pop(code, None)
+async def _new_room_code(r: aioredis.Redis) -> str:
+    for _ in range(200):
+        code = "".join(random.choices(string.digits, k=4))
+        if not await r.exists(_room_key(code)):
+            return code
+    raise RuntimeError("Could not generate a unique room code")
 
 
+async def _touch_room(r: aioredis.Redis, code: str):
+    """Reset TTL and update last_activity timestamp."""
+    await r.hset(_room_key(code), "last_activity", str(time.time()))
+    await r.expire(_room_key(code), ROOM_TTL)
+
+
+# ── App lifespan ──────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    task = asyncio.create_task(_cleanup_loop())
+    global _redis
+    redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379")
+    _redis = aioredis.from_url(redis_url, decode_responses=False)
+    try:
+        await _redis.ping()
+    except Exception as e:
+        raise RuntimeError(f"Could not connect to Redis at {redis_url}: {e}")
+    print(f"Connected to Redis at {redis_url}")
     yield
-    task.cancel()
+    await _redis.aclose()
 
 
 # ── App ───────────────────────────────────────────────────────────────────────
 app = FastAPI(title="ContactSwap", lifespan=lifespan)
 
 
-# ── Request / response schemas ────────────────────────────────────────────────
+# ── Request schemas ───────────────────────────────────────────────────────────
 class CreateRoomRequest(BaseModel):
     name: str
     url: HttpUrl
@@ -153,63 +187,80 @@ class RoomMemberRequest(BaseModel):
 # ── API routes ────────────────────────────────────────────────────────────────
 @app.post("/api/create_room")
 async def create_room(req: CreateRoomRequest):
-    code = _new_room_code()
+    r = get_redis()
+    code = await _new_room_code(r)
     member_id = _new_id()
     now = time.time()
-    url_str = str(req.url)
 
-    room = Room(
-        code=code,
-        created_at=now,
-        last_activity=now,
-        members={member_id: Member(id=member_id, name=req.name, url=url_str)},
-    )
-    rooms[code] = room
-    room_locks[code] = asyncio.Lock()
-    room_events[code] = asyncio.Event()
+    await r.hset(_room_key(code), mapping={
+        "code":          code,
+        "created_at":    str(now),
+        "last_activity": str(now),
+        "connected":     "0",
+        "member_ids":    json.dumps([member_id]),
+    })
+    await r.expire(_room_key(code), ROOM_TTL)
+
+    await r.hset(_member_key(code, member_id), mapping={
+        "id":   member_id,
+        "name": req.name,
+        "url":  str(req.url),
+    })
+    await r.expire(_member_key(code, member_id), ROOM_TTL)
 
     return {"room_code": code, "member_id": member_id}
 
 
 @app.post("/api/join_room")
 async def join_room(req: JoinRoomRequest):
-    room = rooms.get(req.code)
-    if room is None:
+    r = get_redis()
+    meta = await _get_room_meta(r, req.code)
+
+    if meta is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND,
                             "Room not found. Check the code and try again.")
-    if room.connected:
+    if meta.get("connected") == "1":
         raise HTTPException(status.HTTP_409_CONFLICT,
                             "This room has already been connected. "
                             "Ask your group to start a new room.")
 
     member_id = _new_id()
-    url_str = str(req.url)
+    member_ids = json.loads(meta.get("member_ids", "[]"))
+    member_ids.append(member_id)
 
-    async with room_locks[req.code]:
-        room.members[member_id] = Member(id=member_id, name=req.name, url=url_str)
-        room.last_activity = time.time()
+    await r.hset(_room_key(req.code), "member_ids", json.dumps(member_ids))
+    await _touch_room(r, req.code)
 
-    # Signal all waiting polls for this room immediately
-    room_events[req.code].set()
-    room_events[req.code].clear()
+    await r.hset(_member_key(req.code, member_id), mapping={
+        "id":   member_id,
+        "name": req.name,
+        "url":  str(req.url),
+    })
+    await r.expire(_member_key(req.code, member_id), ROOM_TTL)
+
+    # Wake up all waiting polls for this room immediately
+    await r.publish(_channel(req.code), "join")
 
     return {"room_code": req.code, "member_id": member_id}
 
 
 @app.post("/api/connect")
 async def connect(req: RoomMemberRequest):
-    room = rooms.get(req.code)
-    if room is None:
+    r = get_redis()
+    meta = await _get_room_meta(r, req.code)
+
+    if meta is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Room not found")
-    if req.member_id not in room.members:
+
+    member_ids = json.loads(meta.get("member_ids", "[]"))
+    if req.member_id not in member_ids:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Not a member of this room")
 
-    async with room_locks[req.code]:
-        room.connected = True
-        room.last_activity = time.time()
+    await r.hset(_room_key(req.code), "connected", "1")
+    await _touch_room(r, req.code)
 
-    # Wake up every waiting poll at once — they'll all see connected=True
-    room_events[req.code].set()
+    # Wake all waiting polls — they will all see connected=True
+    await r.publish(_channel(req.code), "connected")
 
     return {"ok": True}
 
@@ -217,64 +268,76 @@ async def connect(req: RoomMemberRequest):
 @app.get("/api/poll")
 async def poll(code: str, member_id: str, count: int = 0):
     """
-    Async long-poll endpoint.
+    Async long-poll backed by Redis Pub/Sub.
 
-    The coroutine suspends with `await asyncio.wait_for(event.wait(), ...)`
-    instead of blocking a thread. The event loop is free to serve other
-    requests while this one waits for a state change.
+    Subscribes to the room's channel. Any publish (join/connect/leave)
+    wakes this coroutine immediately so the client sees the change
+    without waiting up to 1 second as in the old sleep-loop design.
     """
-    room = rooms.get(code)
-    if room is None:
+    r = get_redis()
+    meta = await _get_room_meta(r, code)
+
+    if meta is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Room not found")
-    if member_id not in room.members:
+
+    member_ids = json.loads(meta.get("member_ids", "[]"))
+    if member_id not in member_ids:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Not a member")
 
-    event = room_events.get(code)
-    deadline = time.time() + POLL_TIMEOUT
+    # Return immediately if state already changed since last poll
+    if len(member_ids) != count or meta.get("connected") == "1":
+        return await _room_state(r, code)
 
-    while time.time() < deadline:
-        current_count = len(room.members)
+    # Subscribe and block until a message arrives or timeout
+    pubsub = r.pubsub()
+    await pubsub.subscribe(_channel(code))
+    try:
+        deadline = time.time() + POLL_TIMEOUT
+        while time.time() < deadline:
+            remaining = deadline - time.time()
+            try:
+                msg = await asyncio.wait_for(
+                    pubsub.get_message(ignore_subscribe_messages=True, timeout=remaining),
+                    timeout=remaining + 0.1,
+                )
+            except asyncio.TimeoutError:
+                break
+            if msg is not None:
+                break
+            await asyncio.sleep(0.05)
+    finally:
+        await pubsub.unsubscribe(_channel(code))
+        await pubsub.aclose()
 
-        # Return immediately if something changed since the last poll
-        if current_count != count or room.connected:
-            return _room_state(room, member_id)
-
-        # Suspend this coroutine until the event fires or we time out.
-        # Unlike time.sleep(), this releases the event loop to handle
-        # other requests concurrently.
-        remaining = deadline - time.time()
-        try:
-            await asyncio.wait_for(asyncio.shield(event.wait()), timeout=remaining)
-        except asyncio.TimeoutError:
-            break
-
-    # Timeout — return current state; client will re-poll
-    return _room_state(room, member_id)
+    return await _room_state(r, code)
 
 
 @app.post("/api/leave_room")
 async def leave_room(req: RoomMemberRequest):
-    room = rooms.get(req.code)
-    if room and req.member_id in room.members:
-        async with room_locks[req.code]:
-            room.members.pop(req.member_id, None)
-            room.last_activity = time.time()
-        room_events[req.code].set()
-        room_events[req.code].clear()
+    r = get_redis()
+    meta = await _get_room_meta(r, req.code)
+    if meta:
+        member_ids = json.loads(meta.get("member_ids", "[]"))
+        if req.member_id in member_ids:
+            member_ids.remove(req.member_id)
+            await r.hset(_room_key(req.code), "member_ids", json.dumps(member_ids))
+            await r.delete(_member_key(req.code, req.member_id))
+            await _touch_room(r, req.code)
+            await r.publish(_channel(req.code), "leave")
     return {"ok": True}
 
 
-@app.get('/api/debug')
+# ── Debug endpoint ────────────────────────────────────────────────────────────
+# Useful for confirming Redis connectivity and verifying room keys exist.
+# Remove or restrict this before making the app publicly accessible.
+@app.get("/api/debug")
 async def debug():
-    return {
-        "worker_pid": os.getpid(),
-        "room_codes": list(rooms.keys()),
-        "room_count": len(rooms),
-    }
+    r = get_redis()
+    keys = [k.decode() async for k in r.scan_iter("room:????")]
+    return {"worker_pid": os.getpid(), "room_keys": keys, "room_count": len(keys)}
 
 
-# ── Static files ──────────────────────────────────────────────────────────────
-# Serve index.html at / — FastAPI's StaticFiles handles this efficiently.
+# ── Serve frontend ────────────────────────────────────────────────────────────
 @app.get("/")
 async def index():
     return FileResponse(BASE_DIR / "index.html")
