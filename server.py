@@ -264,6 +264,11 @@ async def leave_room(req: RoomMemberRequest):
     return {"ok": True}
 
 
+@app.get('/api/debug/')
+async def debug():
+    return {"worker_pid": os.getpid(), "room_codes": list(rooms.keys())}
+
+
 # ── Static files ──────────────────────────────────────────────────────────────
 # Serve index.html at / — FastAPI's StaticFiles handles this efficiently.
 @app.get("/")

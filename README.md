@@ -40,7 +40,7 @@ FastAPI is an **ASGI** framework (not WSGI). Use an ASGI-compatible server.
 ### Uvicorn (simplest)
 
 ```bash
-uvicorn wsgi:app --host 0.0.0.0 --port 8080 --workers 4
+uvicorn wsgi:app --host 0.0.0.0 --port 8080 --workers 1
 ```
 
 ### Gunicorn + Uvicorn workers (recommended for production)
