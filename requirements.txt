@@ -1,0 +1,5 @@
+# ContactSwap — Python dependencies
+# Install with: pip install -r requirements.txt
+
+fastapi>=0.111.0       # async web framework with Pydantic validation built in
+uvicorn[standard]>=0.29.0  # ASGI server (includes uvloop + httptools for speed)
