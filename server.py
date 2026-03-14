@@ -103,34 +103,60 @@ async def _touch_room(r: aioredis.Redis, code: str):
     await r.expire(_room_key(code), ROOM_TTL)
 
 
-# ── URL validation helper ─────────────────────────────────────────────────────
-def _validate_redis_url(raw: str) -> str:
+# ── URL sanitisation helper ──────────────────────────────────────────────────
+def _sanitise_redis_url(raw: str) -> str:
     """
-    Strip accidental surrounding quotes/whitespace and validate the URL shape.
-    Raises RuntimeError with a clear message if something looks wrong.
+    1. Strip surrounding whitespace and accidental quote characters.
+    2. If the password contains URL-unsafe characters (e.g. + / =) that were
+       pasted in un-encoded, percent-encode just the password so the URL
+       parser can correctly identify the port.
+    3. Validate that scheme, host, and port are all present.
     """
-    url = raw.strip().strip("'\"")
-    parsed = urlparse(url)
+    from urllib.parse import quote
 
+    url = raw.strip().strip(chr(39)).strip(chr(34))
+
+    # urlparse raises ValueError when special chars in the password (e.g. +)
+    # make the port look non-numeric. Catch it and re-encode the password.
+    needs_encode = False
+    try:
+        parsed = urlparse(url)
+        _ = parsed.port  # accessing .port triggers the ValueError
+        if parsed.port is None and chr(64) in url:
+            needs_encode = True
+    except ValueError:
+        needs_encode = True
+
+    if needs_encode and chr(64) in url:
+        scheme_and_creds, hostpart = url.rsplit(chr(64), 1)
+        if "://" in scheme_and_creds:
+            scheme, creds = scheme_and_creds.split("://", 1)
+        else:
+            scheme, creds = "redis", scheme_and_creds
+        if ":" in creds:
+            user, password = creds.split(":", 1)
+            url = scheme + "://" + user + ":" + quote(password, safe="") + chr(64) + hostpart
+
+    parsed = urlparse(url)
     errors = []
     if parsed.scheme not in ("redis", "rediss"):
-        errors.append(
-            "scheme must be 'redis' or 'rediss', got: " + repr(parsed.scheme)
-        )
+        errors.append("scheme must be redis or rediss, got: " + repr(parsed.scheme))
     if not parsed.hostname:
         errors.append("no hostname found")
-    if parsed.port is None:
-        errors.append("no port found (expected something like :6379)")
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+    if port is None:
+        errors.append("no valid port found (expected e.g. :6379)")
 
     if errors:
-        msg = (
-            "REDIS_URL is invalid.\n"
-            "  Raw value from environment : " + repr(raw) + "\n"
-            "  After stripping whitespace : " + repr(url) + "\n"
-            "  Problem(s)                 : " + "; ".join(errors) + "\n"
-            "  Expected format            : redis://default:PASSWORD@HOST:6379"
+        raise RuntimeError(
+            "REDIS_URL is invalid. Raw=" + repr(raw) +
+            " Processed=" + repr(url) +
+            " Problems: " + "; ".join(errors) +
+            " Tip: encode + as %2B, / as %2F, = as %3D"
         )
-        raise RuntimeError(msg)
 
     return url
 
@@ -141,7 +167,7 @@ async def lifespan(app: FastAPI):
     global _redis
 
     raw_url   = os.environ.get("REDIS_URL", "redis://localhost:6379")
-    redis_url = _validate_redis_url(raw_url)
+    redis_url = _sanitise_redis_url(raw_url)
     parsed    = urlparse(redis_url)
 
     print("Connecting to Redis — host=" + str(parsed.hostname) + " port=" + str(parsed.port))
