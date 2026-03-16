@@ -2,6 +2,14 @@
 
 Share contact links with a group instantly — no accounts, no app install, no pairwise sending.
 
+## The name
+
+When you drop a stone into still water, a single point of contact sends rings outward in every direction simultaneously — each person reached at the same moment, equally, without hierarchy.
+
+That's exactly what Ripple does. One person in a room triggers the exchange, and everyone's contact details spread outward to the whole group at once. No pairwise back-and-forth, no one left waiting, no centre of power. Just a single moment that reaches everyone at the same time.
+
+The name was chosen deliberately over alternatives like *RoundTable* (which can imply a fixed seat and exclusivity) in favour of something that feels more open, spontaneous, and human — like the best in-person gatherings themselves.
+
 ## How it works
 
 1. **One person** goes to the site, enters their name + contact URL, and clicks **"Create room"** → gets a 4-digit code.
