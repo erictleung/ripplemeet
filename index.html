@@ -725,11 +725,36 @@ function showJoin() {
 
 // ── Service picker ────────────────────────────────────────────────────────────
 const SERVICES = {
-  'https://www.linkedin.com/in/':              { prefix: 'linkedin.com/in/',                 label: 'Username / handle', placeholder: 'yourhandle',        free: false },
-  'https://www.instagram.com/':               { prefix: 'instagram.com/',                   label: 'Username / handle', placeholder: 'yourhandle',        free: false },
-  'https://creativemornings.com/individuals/': { prefix: 'creativemornings.com/individuals/', label: 'Username / handle', placeholder: 'yourhandle',        free: false },
-  '__website__':                               { prefix: '',                                  label: 'Website URL',       placeholder: 'https://yoursite.com', free: true  },
-  '__email__':                                 { prefix: '',                                  label: 'Email address',     placeholder: 'you@example.com',    free: true  },
+  'https://www.linkedin.com/in/': {
+    prefix: 'linkedin.com/in/',
+    label: 'Username / handle',
+    placeholder: 'yourhandle',
+    free: false
+  ,
+  'https://www.instagram.com/': {
+    prefix: 'instagram.com/',
+    label: 'Username / handle',
+    placeholder: 'yourhandle',
+    free: false
+  },
+  'https://creativemornings.com/individuals/': {
+    prefix: 'creativemornings.com/individuals/',
+    label: 'Username / handle',
+    placeholder: 'yourhandle',
+    free: false
+  },
+  '__website__': {
+    prefix: '',
+    label: 'Website URL',
+    placeholder: 'https://yoursite.com',
+    free: true
+  },
+  '__email__': {
+    prefix: '',
+    label: 'Email address',
+    placeholder: 'you@example.com',
+    free: true
+  },
 };
 
 function updatePrefix() {
