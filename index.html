@@ -555,7 +555,30 @@
     animation: spin 0.7s linear infinite;
   }
   @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* ── QR code ─────────────────────────────────────────────────────── */
+  .qr-wrap {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.6rem;
+  }
+  .qr-label {
+    font-family: var(--mono);
+    font-size: 0.68rem;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+  #qr-canvas {
+    border-radius: 10px;
+    overflow: hidden;
+    border: 3px solid var(--daffodil);
+    line-height: 0;
+  }
+  #qr-canvas img, #qr-canvas canvas { display: block; }
 </style>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
 </head>
 <body>
 <div class="wrapper">
@@ -656,6 +679,11 @@
         <button class="copy-btn" onclick="copyCode()">Copy</button>
       </div>
 
+      <div class="qr-wrap">
+        <span class="qr-label">Scan to join</span>
+        <div id="qr-canvas"></div>
+      </div>
+
       <div class="status-bar">
         <span class="dot"></span>
         <span id="status-text">Waiting for people to join…</span>
@@ -726,34 +754,34 @@ function showJoin() {
 // ── Service picker ────────────────────────────────────────────────────────────
 const SERVICES = {
   'https://www.linkedin.com/in/': {
-    prefix: 'linkedin.com/in/',
-    label: 'Username / handle',
+    prefix:      'linkedin.com/in/',
+    label:       'Username / handle',
     placeholder: 'yourhandle',
-    free: false
-  ,
+    free:        false,
+  },
   'https://www.instagram.com/': {
-    prefix: 'instagram.com/',
-    label: 'Username / handle',
+    prefix:      'instagram.com/',
+    label:       'Username / handle',
     placeholder: 'yourhandle',
-    free: false
+    free:        false,
   },
   'https://creativemornings.com/individuals/': {
-    prefix: 'creativemornings.com/individuals/',
-    label: 'Username / handle',
+    prefix:      'creativemornings.com/individuals/',
+    label:       'Username / handle',
     placeholder: 'yourhandle',
-    free: false
+    free:        false,
   },
   '__website__': {
-    prefix: '',
-    label: 'Website URL',
+    prefix:      '',
+    label:       'Website URL',
     placeholder: 'https://yoursite.com',
-    free: true
+    free:        true,
   },
   '__email__': {
-    prefix: '',
-    label: 'Email address',
+    prefix:      '',
+    label:       'Email address',
     placeholder: 'you@example.com',
-    free: true
+    free:        true,
   },
 };
 
@@ -855,8 +883,23 @@ async function joinRoom() {
 function enterRoom() {
   document.getElementById('display-code').textContent = myRoomCode;
   lastCount = 0;
+  generateQR();
   show('s-room');
   startPolling();
+}
+
+function generateQR() {
+  const el = document.getElementById('qr-canvas');
+  el.innerHTML = '';   // clear any previous QR
+  const joinUrl = window.location.origin + window.location.pathname + '?join=' + myRoomCode;
+  new QRCode(el, {
+    text: joinUrl,
+    width: 160,
+    height: 160,
+    colorDark: '#19455E',   // denim
+    colorLight: '#FFFFFF',
+    correctLevel: QRCode.CorrectLevel.M,
+  });
 }
 
 function startPolling() {
@@ -1038,6 +1081,22 @@ function nameToColor(name) {
   for (let c of (name || '')) h = (h * 31 + c.charCodeAt(0)) & 0xffffffff;
   return colors[Math.abs(h) % colors.length];
 }
+
+// ── Auto-fill room code from QR scan ────────────────────────────────────────
+(function() {
+  const params = new URLSearchParams(window.location.search);
+  const joinCode = params.get('join');
+  if (joinCode && /^\d{4}$/.test(joinCode)) {
+    // Pre-fill the join code input and show the join sub-form once the page loads
+    window.addEventListener('DOMContentLoaded', () => {});
+    // Use a tiny delay so the DOM is ready
+    setTimeout(() => {
+      document.getElementById('inp-code').value = joinCode;
+      // Clean the URL so refreshing does not re-trigger
+      history.replaceState(null, '', window.location.pathname);
+    }, 50);
+  }
+})();
 
 // Allow Enter key to proceed
 document.addEventListener('keydown', e => {
