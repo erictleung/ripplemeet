@@ -1,26 +1,28 @@
 """
-ASGI entry point for ContactSwap (FastAPI rewrite).
+ASGI entry point for Ripple (FastAPI rewrite).
 
-FastAPI is an ASGI framework, not WSGI. Use an ASGI server:
+⚠️  SINGLE WORKER ONLY — see note below before changing.
 
-    uvicorn  wsgi:app --workers 4 --host 0.0.0.0 --port 8080
-    gunicorn wsgi:app --workers 4 --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:8080
+    uvicorn  wsgi:app --workers 1 --host 0.0.0.0 --port 8080
+    gunicorn wsgi:app --workers 1 --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:8080
 
-Why ASGI instead of WSGI?
---------------------------
-WSGI is synchronous — each request occupies a thread from start to finish.
-ASGI (Asynchronous Server Gateway Interface) is the async successor: a single
-worker can handle thousands of concurrent connections because coroutines
-yield the event loop while waiting (e.g. during the 20-second long-poll),
-rather than blocking a thread.
-
-Worker scaling notes
+Why only one worker?
 --------------------
-Unlike the original http.server version, you CAN safely use multiple
-worker *processes* here as long as state is kept in-process (the default).
-Each worker has its own `rooms` dict, so members must be in the same worker.
-For a small group app on one machine this is fine. For multi-server deployments,
-replace the in-memory store with Redis (see README).
+Room state is stored in the `rooms` dict in memory inside this process.
+Multiple worker *processes* each get their own isolated copy of that dict.
+If Browser A creates a room on Worker 1 and Browser B tries to join on
+Worker 2, Worker 2 has never seen that room and returns 404.
+
+Because the long-poll endpoint is fully async (asyncio.sleep, not
+time.sleep), a single worker can handle hundreds of concurrent connections
+without blocking. For a small group contact-sharing app, one worker is
+the correct and sufficient choice.
+
+Scaling beyond one machine
+--------------------------
+If you ever need multiple workers or servers, replace the in-memory
+`rooms` dict with Redis and swap asyncio.Event for Redis Pub/Sub.
+The route logic in server.py stays the same; only the storage layer changes.
 
 Nginx proxy_read_timeout
 ------------------------
@@ -30,6 +32,14 @@ the 20-second long-poll to complete without being cut off:
     proxy_read_timeout 25s;
 """
 
+import sys
+
 from server import app  # re-export the ASGI callable
 
+# Warn loudly at startup if someone tries to run multiple workers
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("server:app", host="0.0.0.0", port=8080, workers=1)
+
 __all__ = ["app"]
+

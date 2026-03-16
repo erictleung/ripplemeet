@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-RoundTable — Redis-backed FastAPI app.
+Ripple — Redis-backed FastAPI app.
 
 Signalling strategy
 -------------------
@@ -218,7 +218,7 @@ async def lifespan(app: FastAPI):
 
 
 # ── App ───────────────────────────────────────────────────────────────────────
-app = FastAPI(title="RoundTable", lifespan=lifespan)
+app = FastAPI(title="Ripple", lifespan=lifespan)
 
 
 # ── Request schemas ───────────────────────────────────────────────────────────

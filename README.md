@@ -1,6 +1,4 @@
-# roundtable
-
-Simple exchange of contact info of groups with no sign-ups using FastAPI.
+# Ripple
 
 Share contact links with a group instantly — no accounts, no app install, no pairwise sending.
 
@@ -49,9 +47,15 @@ uvicorn wsgi:app --host 0.0.0.0 --port 8080 --workers 1
 pip install gunicorn
 gunicorn wsgi:app \
   --worker-class uvicorn.workers.UvicornWorker \
-  --workers 4 \
+  --workers 1 \
   --bind 0.0.0.0:8080
 ```
+
+> ⚠️ **Always use `--workers 1`.** Room state lives in memory inside the
+> process. Multiple worker processes each get their own isolated copy of
+> `rooms`, so a user who creates a room on Worker 1 will get a 404 when
+> a friend tries to join on Worker 2. Because the long-poll is fully async,
+> one worker handles hundreds of concurrent users without blocking.
 
 ### Nginx (reverse proxy)
 
