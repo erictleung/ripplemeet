@@ -1,11 +1,21 @@
 #!/usr/bin/env python3
 """
-RoundTable — Redis-backed FastAPI app.
+ContactSwap — Redis-backed FastAPI app.
+
+Signalling strategy
+-------------------
+Leapcell Redis does not support SUBSCRIBE/PUBLISH (pub/sub).
+Instead we use a Redis List as a signal queue per room:
+  - On join/connect/leave: LPUSH room:{code}:signal "event"
+  - In poll:               BLPOP room:{code}:signal timeout=20
+BLPOP blocks until an item appears (instant wake-up) or the
+timeout expires, using only standard List commands.
 
 Environment variables
 ---------------------
-  REDIS_URL  — connection string, e.g. redis://default:password@host:6379
-               Set this in Leapcell -> Service -> Environment.
+  HOST, PORT, PASSWORD  — injected by Leapcell when Redis is linked
+  REDIS_URL             — fallback full connection string for local dev
+  REDIS_SSL             — set to "false" to disable TLS (local dev only)
 
 Dev server:   uvicorn server:app --reload --port 8080
 Production:   uvicorn wsgi:app --port 8080 --workers 1
@@ -41,7 +51,7 @@ def get_redis() -> aioredis.Redis:
     return _redis
 
 
-# ── Key / channel helpers ─────────────────────────────────────────────────────
+# ── Key helpers ───────────────────────────────────────────────────────────────
 def _new_id(k: int = 12) -> str:
     return "".join(random.choices(string.ascii_lowercase + string.digits, k=k))
 
@@ -51,8 +61,9 @@ def _room_key(code: str) -> str:
 def _member_key(code: str, member_id: str) -> str:
     return f"room:{code}:member:{member_id}"
 
-def _channel(code: str) -> str:
-    return f"room:{code}"
+def _signal_key(code: str) -> str:
+    """List key used to wake up waiting polls via BLPOP."""
+    return f"room:{code}:signal"
 
 
 # ── Redis data helpers ────────────────────────────────────────────────────────
@@ -77,8 +88,8 @@ async def _room_state(r: aioredis.Redis, code: str) -> dict:
     meta = await _get_room_meta(r, code)
     if not meta:
         return {}
-    connected = meta.get("connected") == "1"
-    members   = await _get_members(r, code, meta)
+    connected   = meta.get("connected") == "1"
+    members     = await _get_members(r, code, meta)
     members_out = (
         members if connected
         else [{"id": m["id"], "name": m["name"]} for m in members]
@@ -103,25 +114,26 @@ async def _touch_room(r: aioredis.Redis, code: str):
     await r.expire(_room_key(code), ROOM_TTL)
 
 
-# ── URL sanitisation helper ──────────────────────────────────────────────────
+async def _signal(r: aioredis.Redis, code: str, event: str):
+    """
+    Wake up all polls waiting on this room by pushing to the signal list.
+    Each waiting BLPOP call consumes one item, so we push one item per
+    expected waiter. Pushing a small fixed number (10) is safe — any
+    unconsumed items expire with the room TTL.
+    """
+    key = _signal_key(code)
+    await r.lpush(key, *([event] * 10))
+    await r.expire(key, 60)   # short TTL — signals are ephemeral
+
+
+# ── URL sanitisation helper ───────────────────────────────────────────────────
 def _sanitise_redis_url(raw: str) -> str:
-    """
-    1. Strip surrounding whitespace and accidental quote characters.
-    2. If the password contains URL-unsafe characters (e.g. + / =) that were
-       pasted in un-encoded, percent-encode just the password so the URL
-       parser can correctly identify the port.
-    3. Validate that scheme, host, and port are all present.
-    """
     from urllib.parse import quote
-
     url = raw.strip().strip(chr(39)).strip(chr(34))
-
-    # urlparse raises ValueError when special chars in the password (e.g. +)
-    # make the port look non-numeric. Catch it and re-encode the password.
     needs_encode = False
     try:
         parsed = urlparse(url)
-        _ = parsed.port  # accessing .port triggers the ValueError
+        _ = parsed.port
         if parsed.port is None and chr(64) in url:
             needs_encode = True
     except ValueError:
@@ -149,7 +161,6 @@ def _sanitise_redis_url(raw: str) -> str:
         port = None
     if port is None:
         errors.append("no valid port found (expected e.g. :6379)")
-
     if errors:
         raise RuntimeError(
             "REDIS_URL is invalid. Raw=" + repr(raw) +
@@ -157,7 +168,6 @@ def _sanitise_redis_url(raw: str) -> str:
             " Problems: " + "; ".join(errors) +
             " Tip: encode + as %2B, / as %2F, = as %3D"
         )
-
     return url
 
 
@@ -166,10 +176,6 @@ def _sanitise_redis_url(raw: str) -> str:
 async def lifespan(app: FastAPI):
     global _redis
 
-    # Leapcell injects HOST, PORT, and PASSWORD as separate environment
-    # variables for linked Redis instances. If all three are present, build
-    # the connection directly from those. Fall back to a REDIS_URL string
-    # (useful for local dev with a single connection string).
     host     = os.environ.get("HOST")
     port_str = os.environ.get("PORT")
     password = os.environ.get("PASSWORD")
@@ -180,14 +186,8 @@ async def lifespan(app: FastAPI):
         except ValueError:
             raise RuntimeError("PORT env var is not a valid integer: " + repr(port_str))
 
-        # REDIS_SSL defaults to true; set it to "false" to disable (local dev only)
         use_ssl = os.environ.get("REDIS_SSL", "true").lower() != "false"
-
-        print("[Redis] host=" + host)
-        print("[Redis] port=" + str(port))
-        print("[Redis] ssl=" + str(use_ssl))
-        print("[Redis] username=default")
-        print("[Redis] password length=" + str(len(password)))
+        print("[Redis] host=" + host + " port=" + str(port) + " ssl=" + str(use_ssl))
 
         _redis = aioredis.Redis(
             host=host,
@@ -196,35 +196,29 @@ async def lifespan(app: FastAPI):
             username="default",
             decode_responses=False,
             ssl=use_ssl,
-            ssl_cert_reqs="none",   # skip cert verification — trust the host, not the cert
-            socket_keepalive=True,   # prevent idle connections being closed by the server
-            health_check_interval=30,  # ping every 30s to keep the connection alive
+            ssl_cert_reqs="none",
+            socket_keepalive=True,
+            health_check_interval=30,
         )
     else:
-        # Fall back to a full REDIS_URL string (local dev or manual config)
         raw_url   = os.environ.get("REDIS_URL", "redis://localhost:6379")
         redis_url = _sanitise_redis_url(raw_url)
         parsed    = urlparse(redis_url)
-        print("Connecting to Redis via REDIS_URL — host=" + str(parsed.hostname) + " port=" + str(parsed.port))
+        print("[Redis] connecting via REDIS_URL host=" + str(parsed.hostname) + " port=" + str(parsed.port))
         _redis = aioredis.from_url(redis_url, decode_responses=False)
 
     try:
         await _redis.ping()
     except Exception as e:
-        raise RuntimeError(
-            "Redis ping failed: " + str(e) + ". "
-            "If the error is Connection closed by server, check: "
-            "(1) PORT env var — TLS usually uses 6380 not 6379, "
-            "(2) REDIS_SSL env var — set to false to disable SSL for testing."
-        )
+        raise RuntimeError("Redis ping failed: " + str(e))
 
-    print("Redis connection established.")
+    print("[Redis] connection established.")
     yield
     await _redis.aclose()
 
 
 # ── App ───────────────────────────────────────────────────────────────────────
-app = FastAPI(title="RoundTable", lifespan=lifespan)
+app = FastAPI(title="ContactSwap", lifespan=lifespan)
 
 
 # ── Request schemas ───────────────────────────────────────────────────────────
@@ -271,7 +265,7 @@ class RoomMemberRequest(BaseModel):
 # ── API routes ────────────────────────────────────────────────────────────────
 @app.post("/api/create_room")
 async def create_room(req: CreateRoomRequest):
-    r = get_redis()
+    r         = get_redis()
     code      = await _new_room_code(r)
     member_id = _new_id()
     now       = time.time()
@@ -322,7 +316,8 @@ async def join_room(req: JoinRoomRequest):
     })
     await r.expire(_member_key(req.code, member_id), ROOM_TTL)
 
-    await r.publish(_channel(req.code), "join")
+    # Wake up waiting polls
+    await _signal(r, req.code, "join")
 
     return {"room_code": req.code, "member_id": member_id}
 
@@ -341,13 +336,22 @@ async def connect(req: RoomMemberRequest):
 
     await r.hset(_room_key(req.code), "connected", "1")
     await _touch_room(r, req.code)
-    await r.publish(_channel(req.code), "connected")
+
+    # Wake up all waiting polls
+    await _signal(r, req.code, "connected")
 
     return {"ok": True}
 
 
 @app.get("/api/poll")
 async def poll(code: str, member_id: str, count: int = 0):
+    """
+    Async long-poll using Redis BLPOP.
+
+    BLPOP blocks until an item is pushed to the signal list (by join,
+    connect, or leave) or the timeout expires. This replaces pub/sub,
+    which is not supported by Leapcell Redis.
+    """
     r    = get_redis()
     meta = await _get_room_meta(r, code)
 
@@ -356,9 +360,8 @@ async def poll(code: str, member_id: str, count: int = 0):
 
     member_ids = json.loads(meta.get("member_ids", "[]"))
 
-    # Retry the membership check briefly to handle the race condition where
-    # the browser starts polling immediately after join_room returns, but
-    # the Redis write hasn't propagated to this read yet.
+    # Brief retry to handle the race where the browser polls immediately
+    # after join_room but the Redis write hasn't been read back yet.
     if member_id not in member_ids:
         for _ in range(5):
             await asyncio.sleep(0.2)
@@ -371,30 +374,12 @@ async def poll(code: str, member_id: str, count: int = 0):
         else:
             raise HTTPException(status.HTTP_403_FORBIDDEN, "Not a member")
 
-    # Return immediately if state already changed
+    # Return immediately if state already changed since last poll
     if len(member_ids) != count or meta.get("connected") == "1":
         return await _room_state(r, code)
 
-    # Block on pub/sub until a change event or timeout
-    pubsub = r.pubsub()
-    await pubsub.subscribe(_channel(code))
-    try:
-        deadline = time.time() + POLL_TIMEOUT
-        while time.time() < deadline:
-            remaining = deadline - time.time()
-            try:
-                msg = await asyncio.wait_for(
-                    pubsub.get_message(ignore_subscribe_messages=True, timeout=remaining),
-                    timeout=remaining + 0.1,
-                )
-            except asyncio.TimeoutError:
-                break
-            if msg is not None:
-                break
-            await asyncio.sleep(0.05)
-    finally:
-        await pubsub.unsubscribe(_channel(code))
-        await pubsub.aclose()
+    # Block until a signal is pushed or timeout — uses only BLPOP (supported)
+    await r.blpop(_signal_key(code), timeout=POLL_TIMEOUT)
 
     return await _room_state(r, code)
 
@@ -410,13 +395,11 @@ async def leave_room(req: RoomMemberRequest):
             await r.hset(_room_key(req.code), "member_ids", json.dumps(member_ids))
             await r.delete(_member_key(req.code, req.member_id))
             await _touch_room(r, req.code)
-            await r.publish(_channel(req.code), "leave")
+            await _signal(r, req.code, "leave")
     return {"ok": True}
 
 
-# -- Debug endpoint ------------------------------------------------------
-# Shows Redis connectivity status and live room keys.
-# Remove or restrict access before going public.
+# ── Debug endpoint ────────────────────────────────────────────────────────────
 @app.get("/api/debug")
 async def debug():
     host     = os.environ.get("HOST")
@@ -457,9 +440,7 @@ async def debug():
     }
 
 
-# ── Leapcell health check ───────────────────────────────────────────
-# Leapcell polls these paths to confirm the server is listening.
-# Returning 200 silences the 404 log noise.
+# ── Leapcell health check ─────────────────────────────────────────────────────
 @app.get("/kaithhealth")
 @app.get("/kaithheathcheck")
 async def health_check():
