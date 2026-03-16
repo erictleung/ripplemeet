@@ -7,8 +7,8 @@ Signalling strategy
 Leapcell Redis does not support SUBSCRIBE/PUBLISH (pub/sub).
 Instead we use a Redis List as a signal queue per room:
   - On join/connect/leave: LPUSH room:{code}:signal "event"
-  - In poll:               BLPOP room:{code}:signal timeout=20
-BLPOP blocks until an item appears (instant wake-up) or the
+  - In poll:               LPOP room:{code}:signal timeout=20
+LPOP blocks until an item appears (instant wake-up) or the
 timeout expires, using only standard List commands.
 
 Environment variables
@@ -62,7 +62,7 @@ def _member_key(code: str, member_id: str) -> str:
     return f"room:{code}:member:{member_id}"
 
 def _signal_key(code: str) -> str:
-    """List key used to wake up waiting polls via BLPOP."""
+    """List key used to wake up waiting polls via LPOP polling."""
     return f"room:{code}:signal"
 
 
@@ -117,9 +117,9 @@ async def _touch_room(r: aioredis.Redis, code: str):
 async def _signal(r: aioredis.Redis, code: str, event: str):
     """
     Wake up all polls waiting on this room by pushing to the signal list.
-    Each waiting BLPOP call consumes one item, so we push one item per
-    expected waiter. Pushing a small fixed number (10) is safe — any
-    unconsumed items expire with the room TTL.
+    Each waiting LPOP loop consumes one item when it wakes up, so we
+    push one item per expected waiter. A fixed number (10) is safe —
+    unconsumed items expire with the signal key TTL.
     """
     key = _signal_key(code)
     await r.lpush(key, *([event] * 10))
@@ -346,11 +346,11 @@ async def connect(req: RoomMemberRequest):
 @app.get("/api/poll")
 async def poll(code: str, member_id: str, count: int = 0):
     """
-    Async long-poll using Redis BLPOP.
+    Async long-poll using LPOP polling.
 
-    BLPOP blocks until an item is pushed to the signal list (by join,
-    connect, or leave) or the timeout expires. This replaces pub/sub,
-    which is not supported by Leapcell Redis.
+    Loops with LPOP + asyncio.sleep(0.5) until a signal item appears
+    or the timeout expires. Replaces pub/sub and LPOP, neither of
+    which are supported by Leapcell Redis.
     """
     r    = get_redis()
     meta = await _get_room_meta(r, code)
@@ -378,8 +378,16 @@ async def poll(code: str, member_id: str, count: int = 0):
     if len(member_ids) != count or meta.get("connected") == "1":
         return await _room_state(r, code)
 
-    # Block until a signal is pushed or timeout — uses only BLPOP (supported)
-    await r.blpop(_signal_key(code), timeout=POLL_TIMEOUT)
+    # Poll the signal list with LPOP until an item appears or we time out.
+    # LPOP is not supported by Leapcell Redis, so we use a plain LPOP
+    # loop with asyncio.sleep() — the await yields the event loop between
+    # checks so no threads are blocked.
+    deadline = time.time() + POLL_TIMEOUT
+    while time.time() < deadline:
+        item = await r.lpop(_signal_key(code))
+        if item is not None:
+            break
+        await asyncio.sleep(0.5)
 
     return await _room_state(r, code)
 
