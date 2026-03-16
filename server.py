@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ContactSwap — Redis-backed FastAPI app.
+RoundTable — Redis-backed FastAPI app.
 
 Signalling strategy
 -------------------
@@ -218,7 +218,7 @@ async def lifespan(app: FastAPI):
 
 
 # ── App ───────────────────────────────────────────────────────────────────────
-app = FastAPI(title="ContactSwap", lifespan=lifespan)
+app = FastAPI(title="RoundTable", lifespan=lifespan)
 
 
 # ── Request schemas ───────────────────────────────────────────────────────────
