@@ -584,15 +584,17 @@
           <option value="https://www.linkedin.com/in/">LinkedIn</option>
           <option value="https://www.instagram.com/">Instagram</option>
           <option value="https://creativemornings.com/individuals/">CreativeMornings</option>
+          <option value="__website__">Website</option>
+          <option value="__email__">Email</option>
         </select>
       </div>
 
       <div class="field">
-        <label>Username / handle</label>
+        <label id="inp-handle-label">Username / handle</label>
         <div class="handle-row">
           <span id="url-prefix" class="handle-prefix">linkedin.com/in/</span>
           <input id="inp-handle" type="text" placeholder="yourhandle"
-                 autocomplete="off" maxlength="200"
+                 autocomplete="off" maxlength="500"
                  oninput="sanitizeHandle(this)" />
         </div>
       </div>
@@ -722,28 +724,38 @@ function showJoin() {
 
 // ── Service picker ────────────────────────────────────────────────────────────
 const SERVICES = {
-  'https://www.linkedin.com/in/':              'linkedin.com/in/',
-  'https://www.instagram.com/':               'instagram.com/',
-  'https://creativemornings.com/individuals/': 'creativemornings.com/individuals/',
+  'https://www.linkedin.com/in/':              { prefix: 'linkedin.com/in/',                 label: 'Username / handle', placeholder: 'yourhandle',        free: false },
+  'https://www.instagram.com/':               { prefix: 'instagram.com/',                   label: 'Username / handle', placeholder: 'yourhandle',        free: false },
+  'https://creativemornings.com/individuals/': { prefix: 'creativemornings.com/individuals/', label: 'Username / handle', placeholder: 'yourhandle',        free: false },
+  '__website__':                               { prefix: '',                                  label: 'Website URL',       placeholder: 'https://yoursite.com', free: true  },
+  '__email__':                                 { prefix: '',                                  label: 'Email address',     placeholder: 'you@example.com',    free: true  },
 };
 
 function updatePrefix() {
-  const base = document.getElementById('inp-service').value;
-  document.getElementById('url-prefix').textContent = SERVICES[base] || base;
-  document.getElementById('inp-handle').value = '';
-  document.getElementById('inp-handle').focus();
+  const base    = document.getElementById('inp-service').value;
+  const svc     = SERVICES[base] || { prefix: base, label: 'Username / handle', placeholder: 'yourhandle', free: false };
+  const prefixEl = document.getElementById('url-prefix');
+  const input   = document.getElementById('inp-handle');
+  const label   = document.getElementById('inp-handle-label');
+
+  prefixEl.textContent = svc.prefix;
+  prefixEl.style.display = svc.free ? 'none' : '';
+  input.placeholder = svc.placeholder;
+  label.textContent = svc.label;
+  input.value = '';
+  input.focus();
 }
 
 function sanitizeHandle(input) {
+  const base = document.getElementById('inp-service').value;
+  const svc  = SERVICES[base];
+  // Free-form fields (Website, Email) — no sanitisation needed
+  if (svc && svc.free) return;
   // Strip any full URL accidentally pasted in — keep only the final path segment
   let v = input.value.trim();
-  // Remove protocol + domain if present
   v = v.replace(/^https?:\/\/[^/]+\/?/, '');
-  // Remove the service base path if pasted
-  const base = document.getElementById('inp-service').value;
   const path = new URL(base).pathname.replace(/^\//, '');
   if (path && v.startsWith(path)) v = v.slice(path.length);
-  // Strip leading @ and slashes
   v = v.replace(/^[@/]+/, '').replace(/\/$/, '');
   input.value = v;
 }
@@ -752,15 +764,25 @@ function sanitizeHandle(input) {
 function goToChoice() {
   const name   = document.getElementById('inp-name').value.trim();
   const base   = document.getElementById('inp-service').value;
-  const handle = document.getElementById('inp-handle').value.trim().replace(/^[@/]+/, '');
+  const svc    = SERVICES[base];
+  const raw    = document.getElementById('inp-handle').value.trim();
+  const handle = (svc && svc.free) ? raw : raw.replace(/^[@/]+/, '');
   const err    = document.getElementById('err-entry');
 
   if (!name)   { showErr(err, 'Please enter your name.'); return; }
-  if (!handle) { showErr(err, 'Please enter your username or handle.'); return; }
+  if (!handle) { showErr(err, 'Please enter your ' + (svc ? svc.label.toLowerCase() : 'username') + '.'); return; }
+
+  // Basic validation for free-form fields
+  if (base === '__email__' && !handle.includes('@')) {
+    showErr(err, 'Please enter a valid email address.'); return;
+  }
+  if (base === '__website__' && !isValidUrl(handle)) {
+    showErr(err, 'Please enter a valid URL starting with https://.'); return;
+  }
 
   err.style.display = 'none';
   myName = name;
-  myUrl  = base + handle;
+  myUrl  = (svc && svc.free) ? handle : base + handle;
   show('s-choice');
 }
 
