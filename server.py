@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ContactSwap — Redis-backed FastAPI app.
+RoundTable — Redis-backed FastAPI app.
 
 Environment variables
 ---------------------
@@ -179,14 +179,26 @@ async def lifespan(app: FastAPI):
             port = int(port_str)
         except ValueError:
             raise RuntimeError("PORT env var is not a valid integer: " + repr(port_str))
-        print("Connecting to Redis via HOST/PORT/PASSWORD — host=" + host + " port=" + str(port))
+
+        # REDIS_SSL defaults to true; set it to "false" to disable (local dev only)
+        use_ssl = os.environ.get("REDIS_SSL", "true").lower() != "false"
+
+        print("[Redis] host=" + host)
+        print("[Redis] port=" + str(port))
+        print("[Redis] ssl=" + str(use_ssl))
+        print("[Redis] username=default")
+        print("[Redis] password length=" + str(len(password)))
+
         _redis = aioredis.Redis(
             host=host,
             port=port,
             password=password,
             username="default",
             decode_responses=False,
-            ssl=True,
+            ssl=use_ssl,
+            ssl_cert_reqs="none",   # skip cert verification — trust the host, not the cert
+            socket_keepalive=True,   # prevent idle connections being closed by the server
+            health_check_interval=30,  # ping every 30s to keep the connection alive
         )
     else:
         # Fall back to a full REDIS_URL string (local dev or manual config)
@@ -199,7 +211,12 @@ async def lifespan(app: FastAPI):
     try:
         await _redis.ping()
     except Exception as e:
-        raise RuntimeError("Redis ping failed: " + str(e))
+        raise RuntimeError(
+            "Redis ping failed: " + str(e) + ". "
+            "If the error is Connection closed by server, check: "
+            "(1) PORT env var — TLS usually uses 6380 not 6379, "
+            "(2) REDIS_SSL env var — set to false to disable SSL for testing."
+        )
 
     print("Redis connection established.")
     yield
@@ -207,7 +224,7 @@ async def lifespan(app: FastAPI):
 
 
 # ── App ───────────────────────────────────────────────────────────────────────
-app = FastAPI(title="ContactSwap", lifespan=lifespan)
+app = FastAPI(title="RoundTable", lifespan=lifespan)
 
 
 # ── Request schemas ───────────────────────────────────────────────────────────
@@ -438,6 +455,15 @@ async def debug():
         "room_keys":   keys,
         "room_count":  len(keys),
     }
+
+
+# ── Leapcell health check ───────────────────────────────────────────
+# Leapcell polls these paths to confirm the server is listening.
+# Returning 200 silences the 404 log noise.
+@app.get("/kaithhealth")
+@app.get("/kaithheathcheck")
+async def health_check():
+    return {"status": "ok"}
 
 
 # ── Serve frontend ────────────────────────────────────────────────────────────
