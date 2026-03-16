@@ -166,17 +166,39 @@ def _sanitise_redis_url(raw: str) -> str:
 async def lifespan(app: FastAPI):
     global _redis
 
-    raw_url   = os.environ.get("REDIS_URL", "redis://localhost:6379")
-    redis_url = _sanitise_redis_url(raw_url)
-    parsed    = urlparse(redis_url)
+    # Leapcell injects HOST, PORT, and PASSWORD as separate environment
+    # variables for linked Redis instances. If all three are present, build
+    # the connection directly from those. Fall back to a REDIS_URL string
+    # (useful for local dev with a single connection string).
+    host     = os.environ.get("HOST")
+    port_str = os.environ.get("PORT")
+    password = os.environ.get("PASSWORD")
 
-    print("Connecting to Redis — host=" + str(parsed.hostname) + " port=" + str(parsed.port))
+    if host and port_str and password:
+        try:
+            port = int(port_str)
+        except ValueError:
+            raise RuntimeError("PORT env var is not a valid integer: " + repr(port_str))
+        print("Connecting to Redis via HOST/PORT/PASSWORD — host=" + host + " port=" + str(port))
+        _redis = aioredis.Redis(
+            host=host,
+            port=port,
+            password=password,
+            username="default",
+            decode_responses=False,
+        )
+    else:
+        # Fall back to a full REDIS_URL string (local dev or manual config)
+        raw_url   = os.environ.get("REDIS_URL", "redis://localhost:6379")
+        redis_url = _sanitise_redis_url(raw_url)
+        parsed    = urlparse(redis_url)
+        print("Connecting to Redis via REDIS_URL — host=" + str(parsed.hostname) + " port=" + str(parsed.port))
+        _redis = aioredis.from_url(redis_url, decode_responses=False)
 
-    _redis = aioredis.from_url(redis_url, decode_responses=False)
     try:
         await _redis.ping()
     except Exception as e:
-        raise RuntimeError("Redis ping failed for " + repr(redis_url) + ": " + str(e))
+        raise RuntimeError("Redis ping failed: " + str(e))
 
     print("Redis connection established.")
     yield
@@ -374,17 +396,28 @@ async def leave_room(req: RoomMemberRequest):
     return {"ok": True}
 
 
-# ── Debug endpoint ────────────────────────────────────────────────────────────
+# -- Debug endpoint ------------------------------------------------------
 # Shows Redis connectivity status and live room keys.
 # Remove or restrict access before going public.
 @app.get("/api/debug")
 async def debug():
-    raw_url   = os.environ.get("REDIS_URL", "(not set — using localhost default)")
-    redis_url = raw_url.strip().strip("'\"")
-    parsed    = urlparse(redis_url)
+    host     = os.environ.get("HOST")
+    port_str = os.environ.get("PORT")
+    password = os.environ.get("PASSWORD")
 
-    r         = get_redis()
-    ping_ok   = False
+    if host and port_str and password:
+        conn_method = "HOST/PORT/PASSWORD env vars"
+        redis_host  = host
+        redis_port  = port_str
+    else:
+        raw_url     = os.environ.get("REDIS_URL", "(not set)")
+        parsed      = urlparse(raw_url.strip())
+        conn_method = "REDIS_URL env var"
+        redis_host  = str(parsed.hostname)
+        redis_port  = str(parsed.port)
+
+    r          = get_redis()
+    ping_ok    = False
     ping_error = None
     try:
         await r.ping()
@@ -395,14 +428,14 @@ async def debug():
     keys = [k.decode() async for k in r.scan_iter("room:????")] if ping_ok else []
 
     return {
-        "worker_pid":   os.getpid(),
-        "redis_scheme": parsed.scheme,
-        "redis_host":   parsed.hostname,
-        "redis_port":   parsed.port,
-        "ping_ok":      ping_ok,
-        "ping_error":   ping_error,
-        "room_keys":    keys,
-        "room_count":   len(keys),
+        "worker_pid":  os.getpid(),
+        "conn_method": conn_method,
+        "redis_host":  redis_host,
+        "redis_port":  redis_port,
+        "ping_ok":     ping_ok,
+        "ping_error":  ping_error,
+        "room_keys":   keys,
+        "room_count":  len(keys),
     }
 
 
