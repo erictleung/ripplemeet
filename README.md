@@ -2,6 +2,8 @@
 
 Share contact links with a group instantly — no accounts, no app install, no pairwise sending.
 
+<img width="709" height="672" alt="image" src="https://github.com/user-attachments/assets/31be35d3-d0f3-40dc-88a2-e04204d47ed3" />
+
 ## The name
 
 When you drop a stone into still water, a single point of contact sends rings outward in every direction simultaneously — each person reached at the same moment, equally, without hierarchy.
